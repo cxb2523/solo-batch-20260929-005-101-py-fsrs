@@ -46,7 +46,7 @@ class TestPyFSRS:
 
             review_datetime = card.due
 
-        assert ivl_history == [0, 2, 11, 46, 163, 498, 0, 0, 2, 4, 7, 12, 21]
+        assert ivl_history == [0, 2, 11, 46, 163, 498, 0, 0, 0, 498, 1349, 3302, 7424]
 
     def test_repeated_correct_reviews(self):
         scheduler = Scheduler(enable_fuzzing=False)
@@ -85,8 +85,8 @@ class TestPyFSRS:
                 card=card, rating=rating, review_datetime=review_datetime
             )
 
-        assert card.stability == pytest.approx(53.62691, abs=1e-4)
-        assert card.difficulty == pytest.approx(6.3574867, abs=1e-4)
+        assert card.stability == pytest.approx(53.18990, abs=1e-4)
+        assert card.difficulty == pytest.approx(6.3686273, abs=1e-4)
 
     def test_repeat_default_arg(self):
         scheduler = Scheduler()
@@ -318,7 +318,7 @@ class TestPyFSRS:
             ivl_history.append(ivl)
             now = card.due
 
-        assert ivl_history == [0, 2, 11, 46, 163, 498, 0, 0, 2, 4, 7, 12, 21]
+        assert ivl_history == [0, 2, 11, 46, 163, 498, 0, 0, 0, 498, 1349, 3302, 7424]
 
         # initialize another scheduler and verify parameters are properly set
         parameters2 = (
@@ -451,8 +451,8 @@ class TestPyFSRS:
         assert card.state == State.Learning
         assert card.step == 0
         assert (
-            round((card.due - created_at).total_seconds() / 10) == 33
-        )  # card is due in approx. 5.5 minutes (330 seconds)
+            round((card.due - created_at).total_seconds() / 10) == 6
+        )  # Hard keeps the card on the first step, due in 1 minute (60 seconds)
 
     def test_easy_learning_steps(self):
         scheduler = Scheduler()
@@ -511,12 +511,16 @@ class TestPyFSRS:
         )
 
         assert card.state == State.Relearning
+        assert card.step == 0
         assert (
-            round((card.due - prev_due).total_seconds() / 60) == 10
-        )  # card is due in 10 minutes
+            round((card.due - prev_due).total_seconds() / 60) == 1
+        )  # card is due in 1 minute (the first relearning step)
 
     def test_relearning(self):
-        scheduler = Scheduler(enable_fuzzing=False)
+        scheduler = Scheduler(
+            enable_fuzzing=False,
+            relearning_steps=(timedelta(minutes=10),),
+        )
 
         card = Card()
 
@@ -879,7 +883,7 @@ class TestPyFSRS:
 
         interval_length = new_due_datetime - initial_due_datetime
 
-        expected_interval_length = first_learning_step * 1.5
+        expected_interval_length = first_learning_step
 
         tolerance = timedelta(seconds=1)
 
@@ -964,7 +968,19 @@ class TestPyFSRS:
             review_datetime=next_review_datetime_one_day_late,
         )
 
+        # first relearning Good only advances a step; difficulty and stability
+        # stay frozen until the final Good graduates the card
+        assert card.state == State.Relearning
+        assert card.step == 1
+
+        card, _ = scheduler.review_card(
+            card=card,
+            rating=Rating.Good,
+            review_datetime=card.due + timedelta(days=1),
+        )
+
         assert card.state == State.Review
+        assert card.step is None
 
     def test_relearning_card_rate_hard_one_relearning_step(self):
         first_relearning_step = timedelta(minutes=10)
@@ -1001,7 +1017,7 @@ class TestPyFSRS:
 
         interval_length = new_due_datetime - prev_due_datetime
 
-        expected_interval_length = first_relearning_step * 1.5
+        expected_interval_length = first_relearning_step
 
         tolerance = timedelta(seconds=1)
 
@@ -1043,9 +1059,7 @@ class TestPyFSRS:
 
         interval_length = new_due_datetime - prev_due_datetime
 
-        expected_interval_length = (
-            first_relearning_step + second_relearning_step
-        ) / 2.0
+        expected_interval_length = first_relearning_step
 
         tolerance = timedelta(seconds=1)
 
@@ -1203,8 +1217,10 @@ class TestPyFSRS:
         assert card.card_id == rescheduled_card.card_id
         assert card.state != rescheduled_card.state
         assert card.step != rescheduled_card.step
-        assert card.stability == rescheduled_card.stability
-        assert card.difficulty == rescheduled_card.difficulty
+        # memo state is frozen while the replay stays on learning steps, so a
+        # scheduler whose steps never graduate keeps the initial parameters
+        assert card.stability != rescheduled_card.stability
+        assert card.difficulty != rescheduled_card.difficulty
         assert card.last_review == rescheduled_card.last_review
         assert card.due > rescheduled_card.due
 

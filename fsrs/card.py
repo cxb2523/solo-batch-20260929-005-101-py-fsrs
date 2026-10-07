@@ -78,7 +78,11 @@ class Card:
 
         self.state = state
 
-        if self.state == State.Learning and step is None:
+        if self.state == State.Review:
+            # a graduated card can never also be sitting on a learning step
+            step = None
+        elif step is None:
+            # legacy cards missing their step start at the first step
             step = 0
         self.step = step
 

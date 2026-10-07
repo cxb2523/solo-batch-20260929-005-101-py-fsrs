@@ -26,7 +26,7 @@ from fsrs.state import State
 
 if TYPE_CHECKING:
     from torch import Tensor  # torch is optional; import only for type checking
-from typing_extensions import Self
+from typing_extensions import NotRequired, Self
 
 FSRS_DEFAULT_DECAY = 0.1542
 DEFAULT_PARAMETERS = (
@@ -132,8 +132,8 @@ class SchedulerDict(TypedDict):
 
     parameters: list[float]
     desired_retention: float
-    learning_steps: list[int]
-    relearning_steps: list[int]
+    learning_steps: NotRequired[list[int]]
+    relearning_steps: NotRequired[list[int]]
     maximum_interval: int
     enable_fuzzing: bool
 
@@ -170,6 +170,7 @@ class Scheduler:
             timedelta(minutes=10),
         ),
         relearning_steps: tuple[timedelta, ...] | list[timedelta] = (
+            timedelta(minutes=1),
             timedelta(minutes=10),
         ),
         maximum_interval: int = 36500,
@@ -274,42 +275,51 @@ class Scheduler:
             case State.Learning:
                 assert card.step is not None
 
-                # update the card's stability and difficulty
-                if card.stability is None or card.difficulty is None:
-                    card.stability = self._initial_stability(rating=rating)
-                    card.difficulty = self._initial_difficulty(
-                        rating=rating, clamp=True
+                if len(self.learning_steps) == 0 or rating == Rating.Easy:
+                    graduates_this_review = True
+                elif rating == Rating.Good:
+                    # Good only graduates from the final step; Hard always
+                    # stays put and Again always returns to the first step
+                    graduates_this_review = (
+                        card.step >= len(self.learning_steps) - 1
                     )
-
-                elif days_since_last_review is not None and days_since_last_review < 1:
-                    card.stability = self._short_term_stability(
-                        stability=card.stability, rating=rating
-                    )
-                    card.difficulty = self._next_difficulty(
-                        difficulty=card.difficulty, rating=rating
-                    )
-
                 else:
-                    card.stability = self._next_stability(
-                        difficulty=card.difficulty,
-                        stability=card.stability,
-                        retrievability=self.get_card_retrievability(
-                            card,
-                            current_datetime=review_datetime,
-                        ),
-                        rating=rating,
-                    )
-                    card.difficulty = self._next_difficulty(
-                        difficulty=card.difficulty, rating=rating
-                    )
+                    graduates_this_review = False
 
-                # calculate the card's next interval
-                ## first if-clause handles edge case where the Card in the Learning state was previously
-                ## scheduled with a Scheduler with more learning_steps than the current Scheduler
-                if len(self.learning_steps) == 0 or (
-                    card.step >= len(self.learning_steps)
-                    and rating in (Rating.Hard, Rating.Good, Rating.Easy)
-                ):
+                if graduates_this_review:
+                    # only the last Good/Easy step recomputes the long-term
+                    # difficulty and stability
+                    if card.stability is None or card.difficulty is None:
+                        card.stability = self._initial_stability(rating=rating)
+                        card.difficulty = self._initial_difficulty(
+                            rating=rating, clamp=True
+                        )
+
+                    elif (
+                        days_since_last_review is not None
+                        and days_since_last_review < 1
+                    ):
+                        card.stability = self._short_term_stability(
+                            stability=card.stability, rating=rating
+                        )
+                        card.difficulty = self._next_difficulty(
+                            difficulty=card.difficulty, rating=rating
+                        )
+
+                    else:
+                        card.stability = self._next_stability(
+                            difficulty=card.difficulty,
+                            stability=card.stability,
+                            retrievability=self.get_card_retrievability(
+                                card,
+                                current_datetime=review_datetime,
+                            ),
+                            rating=rating,
+                        )
+                        card.difficulty = self._next_difficulty(
+                            difficulty=card.difficulty, rating=rating
+                        )
+
                     card.state = State.Review
                     card.step = None
 
@@ -317,135 +327,116 @@ class Scheduler:
                     next_interval = timedelta(days=next_interval_days)
 
                 else:
+                    # steps not exhausted: difficulty and stability stay frozen
+                    if card.stability is None or card.difficulty is None:
+                        card.stability = self._initial_stability(rating=rating)
+                        card.difficulty = self._initial_difficulty(
+                            rating=rating, clamp=True
+                        )
+
                     match rating:
                         case Rating.Again:
                             card.step = 0
-                            next_interval = self.learning_steps[card.step]
-
                         case Rating.Hard:
-                            # card step stays the same
-
-                            if card.step == 0 and len(self.learning_steps) == 1:
-                                next_interval = self.learning_steps[0] * 1.5
-                            elif card.step == 0 and len(self.learning_steps) >= 2:
-                                next_interval = (
-                                    self.learning_steps[0] + self.learning_steps[1]
-                                ) / 2.0
-                            else:
-                                next_interval = self.learning_steps[card.step]
-
+                            # Hard keeps the card on the same step
+                            pass
                         case Rating.Good:
-                            if card.step + 1 == len(
-                                self.learning_steps
-                            ):  # the last step
-                                card.state = State.Review
-                                card.step = None
-
-                                next_interval_days = self._next_interval(
-                                    stability=card.stability
-                                )
-                                next_interval = timedelta(days=next_interval_days)
-
-                            else:
-                                card.step += 1
-                                next_interval = self.learning_steps[card.step]
-
-                        case Rating.Easy:
-                            card.state = State.Review
-                            card.step = None
-
-                            next_interval_days = self._next_interval(
-                                stability=card.stability
-                            )
-                            next_interval = timedelta(days=next_interval_days)
-
+                            card.step += 1
                         case _:
                             raise ValueError(f"Unknown rating: {rating}")
+
+                    next_interval = self._step_interval(
+                        steps=self.learning_steps,
+                        step=card.step,
+                        stability=card.stability,
+                    )
 
             case State.Review:
                 assert card.stability is not None
                 assert card.difficulty is not None
 
-                # update the card's stability and difficulty
-                if days_since_last_review is not None and days_since_last_review < 1:
-                    card.stability = self._short_term_stability(
-                        stability=card.stability, rating=rating
+                if rating == Rating.Again and len(self.relearning_steps) > 0:
+                    # move into relearning and freeze the long-term parameters
+                    # until its steps are exhausted; the Again penalty is
+                    # applied by the formula at graduation
+                    card.state = State.Relearning
+                    card.step = 0
+
+                    next_interval = self._step_interval(
+                        steps=self.relearning_steps,
+                        step=card.step,
                     )
+
                 else:
-                    card.stability = self._next_stability(
-                        difficulty=card.difficulty,
-                        stability=card.stability,
-                        retrievability=self.get_card_retrievability(
-                            card,
-                            current_datetime=review_datetime,
-                        ),
-                        rating=rating,
+                    if (
+                        days_since_last_review is not None
+                        and days_since_last_review < 1
+                    ):
+                        card.stability = self._short_term_stability(
+                            stability=card.stability, rating=rating
+                        )
+                    else:
+                        card.stability = self._next_stability(
+                            difficulty=card.difficulty,
+                            stability=card.stability,
+                            retrievability=self.get_card_retrievability(
+                                card,
+                                current_datetime=review_datetime,
+                            ),
+                            rating=rating,
+                        )
+
+                    card.difficulty = self._next_difficulty(
+                        difficulty=card.difficulty, rating=rating
                     )
 
-                card.difficulty = self._next_difficulty(
-                    difficulty=card.difficulty, rating=rating
-                )
-
-                # calculate the card's next interval
-                match rating:
-                    case Rating.Again:
-                        # if there are no relearning steps (they were left blank)
-                        if len(self.relearning_steps) == 0:
-                            next_interval_days = self._next_interval(
-                                stability=card.stability
-                            )
-                            next_interval = timedelta(days=next_interval_days)
-
-                        else:
-                            card.state = State.Relearning
-                            card.step = 0
-
-                            next_interval = self.relearning_steps[card.step]
-
-                    case Rating.Hard | Rating.Good | Rating.Easy:
-                        next_interval_days = self._next_interval(
-                            stability=card.stability
-                        )
-                        next_interval = timedelta(days=next_interval_days)
-
-                    case _:
-                        raise ValueError(f"Unknown rating: {rating}")
+                    next_interval_days = self._next_interval(
+                        stability=card.stability
+                    )
+                    next_interval = timedelta(days=next_interval_days)
 
             case State.Relearning:
                 assert card.stability is not None
                 assert card.difficulty is not None
                 assert card.step is not None
 
-                # update the card's stability and difficulty
-                if days_since_last_review is not None and days_since_last_review < 1:
-                    card.stability = self._short_term_stability(
-                        stability=card.stability, rating=rating
+                if len(self.relearning_steps) == 0 or rating == Rating.Easy:
+                    graduates_this_review = True
+                elif rating == Rating.Good:
+                    graduates_this_review = (
+                        card.step >= len(self.relearning_steps) - 1
                     )
-                    card.difficulty = self._next_difficulty(
-                        difficulty=card.difficulty, rating=rating
-                    )
-
                 else:
-                    card.stability = self._next_stability(
-                        difficulty=card.difficulty,
-                        stability=card.stability,
-                        retrievability=self.get_card_retrievability(
-                            card,
-                            current_datetime=review_datetime,
-                        ),
-                        rating=rating,
-                    )
-                    card.difficulty = self._next_difficulty(
-                        difficulty=card.difficulty, rating=rating
-                    )
+                    graduates_this_review = False
 
-                # calculate the card's next interval
-                ## first if-clause handles edge case where the Card in the Relearning state was previously
-                ## scheduled with a Scheduler with more relearning_steps than the current Scheduler
-                if len(self.relearning_steps) == 0 or (
-                    card.step >= len(self.relearning_steps)
-                    and rating in (Rating.Hard, Rating.Good, Rating.Easy)
-                ):
+                if graduates_this_review:
+                    # only the last Good/Easy step recomputes the long-term
+                    # difficulty and stability
+                    if (
+                        days_since_last_review is not None
+                        and days_since_last_review < 1
+                    ):
+                        card.stability = self._short_term_stability(
+                            stability=card.stability, rating=rating
+                        )
+                        card.difficulty = self._next_difficulty(
+                            difficulty=card.difficulty, rating=rating
+                        )
+
+                    else:
+                        card.stability = self._next_stability(
+                            difficulty=card.difficulty,
+                            stability=card.stability,
+                            retrievability=self.get_card_retrievability(
+                                card,
+                                current_datetime=review_datetime,
+                            ),
+                            rating=rating,
+                        )
+                        card.difficulty = self._next_difficulty(
+                            difficulty=card.difficulty, rating=rating
+                        )
+
                     card.state = State.Review
                     card.step = None
 
@@ -453,50 +444,23 @@ class Scheduler:
                     next_interval = timedelta(days=next_interval_days)
 
                 else:
+                    # steps not exhausted: difficulty and stability stay frozen
                     match rating:
                         case Rating.Again:
                             card.step = 0
-                            next_interval = self.relearning_steps[card.step]
-
                         case Rating.Hard:
-                            # card step stays the same
-
-                            if card.step == 0 and len(self.relearning_steps) == 1:
-                                next_interval = self.relearning_steps[0] * 1.5
-                            elif card.step == 0 and len(self.relearning_steps) >= 2:
-                                next_interval = (
-                                    self.relearning_steps[0] + self.relearning_steps[1]
-                                ) / 2.0
-                            else:
-                                next_interval = self.relearning_steps[card.step]
-
+                            # Hard keeps the card on the same step
+                            pass
                         case Rating.Good:
-                            if card.step + 1 == len(
-                                self.relearning_steps
-                            ):  # the last step
-                                card.state = State.Review
-                                card.step = None
-
-                                next_interval_days = self._next_interval(
-                                    stability=card.stability
-                                )
-                                next_interval = timedelta(days=next_interval_days)
-
-                            else:
-                                card.step += 1
-                                next_interval = self.relearning_steps[card.step]
-
-                        case Rating.Easy:
-                            card.state = State.Review
-                            card.step = None
-
-                            next_interval_days = self._next_interval(
-                                stability=card.stability
-                            )
-                            next_interval = timedelta(days=next_interval_days)
-
+                            card.step += 1
                         case _:
                             raise ValueError(f"Unknown rating: {rating}")
+
+                    next_interval = self._step_interval(
+                        steps=self.relearning_steps,
+                        step=card.step,
+                        stability=card.stability,
+                    )
 
             case _:
                 raise ValueError(f"Unknown card state: {card.state}")
@@ -597,11 +561,11 @@ class Scheduler:
             desired_retention=source_dict["desired_retention"],
             learning_steps=[
                 timedelta(seconds=learning_step)
-                for learning_step in source_dict["learning_steps"]
+                for learning_step in source_dict.get("learning_steps", [])
             ],
             relearning_steps=[
                 timedelta(seconds=relearning_step)
-                for relearning_step in source_dict["relearning_steps"]
+                for relearning_step in source_dict.get("relearning_steps", [])
             ],
             maximum_interval=source_dict["maximum_interval"],
             enable_fuzzing=source_dict["enable_fuzzing"],
@@ -693,6 +657,52 @@ class Scheduler:
         next_interval = min(next_interval, self.maximum_interval)
 
         return next_interval
+
+    def remaining_steps(self, card: Card) -> int:
+        """
+        Number of learning/relearning steps still ahead of the card.
+
+        Review (graduated) cards always report 0 remaining steps.
+        """
+
+        if card.state == State.Review or card.step is None:
+            return 0
+
+        if card.state == State.Learning:
+            steps = self.learning_steps
+        elif card.state == State.Relearning:
+            steps = self.relearning_steps
+        else:
+            return 0
+
+        return max(0, len(steps) - card.step)
+
+    def _step_interval(
+        self,
+        *,
+        steps: Sequence[timedelta],
+        step: int,
+        stability: float | None = None,
+    ) -> timedelta:
+        """
+        Returns the interval for an ungraduated card.
+
+        Minute-scale learning steps take precedence; when a day-scale interval
+        would also apply, the earlier of the two due dates wins.
+        """
+
+        if step >= len(steps):
+            step = len(steps) - 1
+        step_interval = steps[step]
+
+        if stability is None:
+            return step_interval
+
+        day_interval = timedelta(
+            days=self._next_interval(stability=stability)
+        )
+
+        return min(step_interval, day_interval)
 
     def _short_term_stability(self, *, stability: float, rating: Rating) -> float:
         short_term_stability_increase = (
